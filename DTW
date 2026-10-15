@@ -1,0 +1,108 @@
+
+
+
+import argparse
+import itertools
+import math
+import multiprocessing as mp
+import os
+import time
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
+from functools import lru_cache
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from scipy.cluster.hierarchy import cut_tree, dendrogram, linkage
+from scipy.optimize import linear_sum_assignment
+from scipy.spatial.distance import squareform
+
+
+try:
+    from fastdtw import fastdtw
+except ImportError:
+    fastdtw = None
+
+INPUT_FOLDER = r"E:\paper\AA.csv"
+MAX_CLUSTERS = 10
+MIN_REPRESENTATIVE_FRACTION = 0.25
+YEAR_MATCH_TOLERANCE_DAYS = 15
+MIN_YEAR_OBSERVATIONS = 6
+
+def load_csv(path):
+    df = pd.read_csv(path, index_col=0)
+    if df.shape[1] < METADATA_COLUMNS + 2:
+        raise ValueError("CSV requires date columns followed by two metadata columns")
+    values = df.iloc[:, :-METADATA_COLUMNS].copy()
+    dates = pd.DatetimeIndex(pd.to_datetime(values.columns, errors="raise"))
+    if dates.hasnans or dates.has_duplicates:
+        raise ValueError("Date columns must be valid and unique")
+    if len(dates) < 2:
+        raise ValueError("At least two observation dates are needed")
+    order = np.argsort(dates.to_numpy())
+    dates = dates[order]
+    values = values.iloc[:, order]
+    values = values.apply(pd.to_numeric, errors="coerce")
+    values = values.replace([np.inf, -np.inf], np.nan)
+    x = values.to_numpy(dtype=float)
+    x_clean = x.copy()
+    total_outliers = 0
+    for i in range(len(x)):
+        valid = np.isfinite(x[i])
+        if valid.sum() < 4:
+            continue
+        q1, q3 = np.quantile(x[i, valid], [0.25, 0.75])
+        iqr = q3 - q1
+        mask = valid & ((x[i] < q1 - IQR_OUTLIER_THRESHOLD * iqr) |
+                        (x[i] > q3 + IQR_OUTLIER_THRESHOLD * iqr))
+        total_outliers += int(mask.sum())
+        x_clean[i, mask] = np.nan
+    print(f"  Outliers marked missing (not interpolated): {total_outliers}")
+    return x_clean, df.index.astype(str).tolist(), dates
+
+
+def standardize_rows(x):
+    z = np.full_like(x, np.nan, dtype=float)
+    eligible = np.zeros(len(x), dtype=bool)
+    reasons = []
+    for i, row in enumerate(x):
+        valid = np.isfinite(row)
+        if valid.sum() < MIN_DTW_OBSERVATIONS:
+            reasons.append("too_few_observations")
+            continue
+        std = float(np.std(row[valid]))
+        if not np.isfinite(std) or std <= 1e-10:
+            reasons.append("no_shape_constant_series")
+            continue
+        z[i, valid] = (row[valid] - float(np.mean(row[valid]))) / std
+        eligible[i] = True
+        reasons.append("")
+    return z, eligible, reasons
+
+
+def dtw_distance(z1, z2, dates):
+    if fastdtw is None:
+        raise ImportError("Install FastDTW first: pip install fastdtw")
+    m1, m2 = np.isfinite(z1), np.isfinite(z2)
+    if DTW_DATE_PENALTY == 0:
+        a, b = z1[m1], z2[m2]
+        cost, path = fastdtw(a, b, radius=DTW_RADIUS)
+    else:
+        t = np.asarray((dates - dates[0]).days, dtype=float) / 365.25
+        a = np.column_stack([z1[m1], t[m1]])
+        b = np.column_stack([z2[m2], t[m2]])
+        cost, path = fastdtw(a, b, radius=DTW_RADIUS, dist=_point_cost)
+    return float(cost / len(path))
+
+
+def _point_cost(u, v):
+    return abs(u[0] - v[0]) + DTW_DATE_PENALTY * abs(u[1] - v[1])
+
+def _init_dtw_worker(series, radius, penalty):
+    global _WORKER_SERIES, _WORKER_RADIUS, _WORKER_PENALTY
+    _WORKER_SERIES = series
+    _WORKER_RADIUS = radius
+    _WORKER_PENALTY = penalty
+......
+......
