@@ -2,80 +2,116 @@
 // The full code will be made available upon publication.
 
 
-REF_PEAK_HEIGHT_RATIO = 0.4      
-ALL_PEAK_DISTANCE = 150         
-MAX_LOS = 330                   
-MAX_PEAK_INTERVAL = 457  
-MIN_PEAK_INTERVAL = 150  
-   
-file_local = r'F:\paper'
+from __future__ import annotations
 
-def smooth_curve(x, y, window=15, polyorder=3):
-    if len(x) < 5:
-        return interp1d(x, y, kind='linear', fill_value='extrapolate')
-    df_tmp = pd.DataFrame({'x': x, 'y': y}).drop_duplicates('x').sort_values('x')
-    x_uq = df_tmp['x'].values
-    y_uq = df_tmp['y'].values
-    n = len(x_uq)
-    w = min(window, n)
-    if w % 2 == 0:
-        w -= 1
-    if w < 5:
-        return interp1d(x_uq, y_uq, kind='cubic', fill_value='extrapolate')
-    y_smooth = savgol_filter(y_uq, window_length=w, polyorder=polyorder)
-    return interp1d(x_uq, y_smooth, kind='cubic', fill_value='extrapolate')
+import argparse
+import math
+import warnings
+import traceback
+from pathlib import Path
 
-def harmonic_trend_model(t, a, b, *coeffs):
-    trend = a + b * t
-    omega = 2.0 * np.pi / T_FIXED
-    seasonal = np.zeros_like(t, dtype=float)
-    n_harm = len(coeffs) // 2
-    for k in range(n_harm):
-        C = coeffs[2*k]
-        D = coeffs[2*k+1]
-        seasonal += C * np.cos((k+1) * omega * t) + D * np.sin((k+1) * omega * t)
-    return trend + seasonal
+import numpy as np
+import pandas as pd
+from scipy.optimize import lsq_linear
+from scipy.signal import find_peaks, peak_prominences, savgol_filter
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
-def fit_window(x_obs, y_obs):
-    a0 = np.mean(y_obs)
-    b0 = 0.0
-    amp_est = np.std(y_obs) * 1.5
-    n_coeffs = 2 * HARMONIC_ORDER
-    p0 = [a0, b0] + [0.0] * n_coeffs
-    bounds_lower = [-np.inf, -0.001] + [-amp_est] * n_coeffs
-    bounds_upper = [np.inf, 0.001] + [amp_est] * n_coeffs
+def _parse_dates_compatible(raw: pd.Series) -> pd.Series:
+    text = raw.astype("string").str.strip()
+    text = text.replace({"": pd.NA, "nan": pd.NA, "NaT": pd.NA, "None": pd.NA})
+    eight = text.str.fullmatch(r"(?:19|20)\d{6}", na=False).fillna(False)
+    parsed = pd.Series(pd.NaT, index=raw.index, dtype="datetime64[ns]")
+    if eight.any():
+        parsed.loc[eight] = pd.to_datetime(text.loc[eight], format="%Y%m%d", errors="coerce")
+    other = ~eight
+    if other.any():
+        version = str(pd.__version__).split(".")[0]
+        supports_mixed = version.isdigit() and int(version) >= 2
+        if supports_mixed:
+            part = pd.to_datetime(text.loc[other], errors="coerce", format="mixed")
+            if part.notna().sum() == 0 and text.loc[other].notna().any():
+                part = pd.to_datetime(text.loc[other], errors="coerce")
+        else:
+            part = pd.to_datetime(text.loc[other], errors="coerce")
+        parsed.loc[other] = part
+    return parsed
+
+
+def read_observations(path: Path) -> pd.DataFrame:
+    path = Path(path)
     try:
-        popt, _ = curve_fit(lambda t, *p: harmonic_trend_model(t, *p),
-                            x_obs, y_obs, p0=p0,
-                            bounds=(bounds_lower, bounds_upper), maxfev=20000)
-        return popt
-    except:
+        df = pd.read_csv(path, encoding="utf-8-sig")
+    except UnicodeDecodeError:
+        df = pd.read_csv(path, encoding="gb18030")
+    df.columns = [str(name).strip().lower() for name in df.columns]
+    if not {"t", "y"}.issubset(df.columns):
+        columns = ", ".join(repr(c) for c in df.columns[:12])
+        raise ValueError(
+            f"{path.name} is missing required t/y columns. Found columns: [{columns}]. "
+            "Make sure file_local points to a raw time-series CSV (t=date, y=index value), "
+            "not a previously generated statistics CSV."
+        )
+    if df.empty:
+        raise ValueError(f"{path.name} is empty and contains no observations.")
+
+    dates = _parse_dates_compatible(df["t"])
+    vals = pd.to_numeric(df["y"], errors="coerce")
+    if dates.notna().sum() == 0:
+        samples = df["t"].head(4).tolist()
+        raise ValueError(
+            f"All dates in column t of {path.name} failed to parse. Examples: {samples}; "
+            f"pandas version: {pd.__version__}."
+        )
+    if vals.notna().sum() == 0:
+        samples = df["y"].head(4).tolist()
+        raise ValueError(f"All numeric values in column y of {path.name} are invalid. Examples: {samples}")
+    obs = pd.DataFrame({"t": dates, "y": vals}).dropna()
+    obs = obs[np.isfinite(obs["y"])]
+    if obs.empty:
+        raise ValueError(
+            f"{path.name} has no rows with both a valid date and a valid numeric value."
+        )
+    obs["t"] = obs["t"].dt.normalize()
+    obs = obs.groupby("t", as_index=False)["y"].mean().sort_values("t").reset_index(drop=True)
+    if len(obs) < 2:
+        raise ValueError(
+            f"{path.name} has only {len(obs)} distinct valid observation dates; at least two are required."
+        )
+    obs["year"] = obs["t"].dt.year
+    obs["x_days"] = (obs["t"] - obs["t"].min()).dt.days.astype(float)
+    return obs
+
+
+def _design_matrix(x: np.ndarray, center: float) -> np.ndarray:
+    x = np.asarray(x, float)
+    columns = [np.ones_like(x), (x-center)/T_FIXED]
+    for k in range(1, HARMONIC_ORDER+1):
+        angle = 2*np.pi*k*x/T_FIXED
+        columns.extend([np.cos(angle), np.sin(angle)])
+    return np.column_stack(columns)
+
+
+def _fit_window(x: np.ndarray, y: np.ndarray, center: float):
+    if len(x) < MIN_OBS_PER_WINDOW or not np.isfinite(y).all():
         return None
+    loc = float(np.mean(y))
+    scale = float(np.std(y))
+    if scale < max(1e-12, 1e-11*abs(loc)):
+        return None
+    a = _design_matrix(x, center)
+    yn = (y-loc)/scale
+    lo = [-np.inf, -3.0] + [-1.5]*(2*HARMONIC_ORDER)
+    hi = [np.inf, 3.0] + [1.5]*(2*HARMONIC_ORDER)
+    try:
+        result = lsq_linear(a, yn, bounds=(lo,hi), max_iter=250)
+    except (ValueError, np.linalg.LinAlgError):
+        return None
+    if not result.success or not np.isfinite(result.x).all():
+        return None
+    return center, loc, scale, result.x
 
-
-def compute_circular_quantiles(series, quantiles=[0.5, 0.25, 0.75]):
-    if len(series) == 0:
-        return [np.nan] * len(quantiles)
-    doy = np.array(series.dropna())
-    if len(doy) == 0:
-        return [np.nan] * len(quantiles)
-
-    best_t = 0
-    best_iqr = np.inf
-    for t in range(365):
-        adj = (doy + t) % 365
-        iqr = np.percentile(adj, 75) - np.percentile(adj, 25)
-        if iqr < best_iqr:
-            best_iqr = iqr
-            best_t = t
-
-    adj_best = (doy + best_t) % 365
-    results = []
-    for q in quantiles:
-        q_val = np.percentile(adj_best, q * 100)
-        doy_result = (q_val - best_t) % 365  
-        results.append(doy_result)
-    return results
 
 ......
 ......
