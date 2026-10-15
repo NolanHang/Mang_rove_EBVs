@@ -1,0 +1,121 @@
+
+import os
+for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+            "NUMEXPR_NUM_THREADS"):
+    os.environ[var] = "1"
+
+import hashlib
+import json
+import math
+import re
+import tempfile
+import time
+import traceback
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from pathlib import Path
+from multiprocessing import freeze_support
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy import signal
+
+from pycwt import Morlet, ar1, cwt, rednoise, wct
+import pycwt
+
+try:
+    from pycwt import helpers as _cwt_helpers
+    if hasattr(_cwt_helpers, "_FFTW_KWARGS_DEFAULT"):
+        _cwt_helpers._FFTW_KWARGS_DEFAULT["threads"] = 1
+except ImportError:
+    pass
+
+BASE_DIR = Path(r"E:\paper\WTC")
+MC_COUNT = 1000
+SIGNIFICANCE_LEVEL = 0.95
+DT = 1.0
+DJ = 1 / 12
+S0 = 2 * DT
+MAX_PERIOD = 2048.0
+MIN_PERIOD = 4.0
+MAX_INTERPOLATION_GAP = 10
+MAX_WORKERS = 6
+MC_SEED = 20261014
+SKIP_EXISTING = True
+RECURSIVE_SEARCH = False
+SAVE_VALIDATION_PLOT = True
+
+VARIABLE_PAIRS = [
+    ("Max air temperature", "SDWI"),
+    ("Sea level", "NDMI"),
+]
+SPECIES_MAP = {"海榄雌": "AM"}
+AUTO_DISCOVER = False
+MANUAL_TASKS = [
+    ['AM.csv', 'AM', 'Max air temperature', 'SDWI'],
+    ['AM.csv', 'AM', 'Sea level', 'NDMI']
+    #...
+]
+
+RUN_TAG = f"MC{MC_COUNT}_P{int(MAX_PERIOD)}_DJ{DJ:g}_SIG{SIGNIFICANCE_LEVEL:g}"
+OUTPUT_DIR = BASE_DIR / f"Batch_WTC_Results_{RUN_TAG}"
+CACHE_DIR = OUTPUT_DIR / "_significance_cache"
+ARROW_STEP_X = 100
+ARROW_STEP_Y = 4
+
+plt.rcParams["font.family"] = "Times New Roman"
+plt.rcParams["axes.unicode_minus"] = False
+
+
+def safe_name(text):
+    return re.sub(r'[<>:"/\\|?*]+', "_", str(text)).strip(" .")
+
+
+def read_csv_auto(path, nrows=None):
+    for encoding in ("utf-8-sig", "gb18030"):
+        try:
+            return pd.read_csv(path, encoding=encoding, nrows=nrows)
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"Unable to determine CSV encoding: {path}")
+
+
+def discover_tasks():
+    if not AUTO_DISCOVER:
+        return [(str(BASE_DIR / name), species, x, y)
+                for name, species, x, y in MANUAL_TASKS]
+    paths = (BASE_DIR.rglob("*.csv") if RECURSIVE_SEARCH
+             else BASE_DIR.glob("*.csv"))
+    result = []
+    for path in sorted(paths):
+        if OUTPUT_DIR in path.parents:
+            continue
+        try:
+            columns = set(read_csv_auto(path, nrows=0).columns)
+        except Exception as exc:
+            print(f"[Skipped file] {path.name}: {exc}", flush=True)
+            continue
+        label = path.stem.split("-", 1)[0]
+        species = SPECIES_MAP.get(label, label)
+        for x, y in VARIABLE_PAIRS:
+            if {"date", x, y}.issubset(columns) and x != y:
+                result.append((str(path), species, x, y))
+    return result
+
+
+def interpolate_short_gaps(series, max_gap):
+    s = series.astype(float).copy()
+    if not s.isna().any():
+        return s
+    interpolated = s.interpolate(method="time", limit_area="inside")
+    missing = s.isna()
+    group_id = missing.ne(missing.shift(fill_value=False)).cumsum()
+    lengths = missing.groupby(group_id).transform("sum")
+    s.loc[missing & (lengths <= max_gap)] = interpolated.loc[
+        missing & (lengths <= max_gap)]
+    return s
+......
+......
