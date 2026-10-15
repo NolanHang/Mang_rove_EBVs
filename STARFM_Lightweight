@@ -1,58 +1,140 @@
 // It's just part of the code for STARFM_Lightweight algorithm.
 // The full code will be made available upon publication.
 
+var MODIS_col = ee.ImageCollection('MODIS/061/MOD09A1');
 
-var MODIS_col = ee.ImageCollection("MODIS/061/MOD09A1");
-//ee.ImageCollection("MODIS/061/MOD13A1")
-
-
-/********************paramates********************************/
 var Index = require('users/NO1/Image_deal:compute_Index');
-var Harmony_data = require('users/NO1/Image_deal:image_band_combine');
 var ReCloud = require('users/NO1/Image_deal:Remove_cloud/remove_cloud_collection');
 
+var aoi = beilun_River;
+var points_export = BG;
+var point_col_name = 'BG_Pints';
+
 var index_List = ['NDVI','GDVI','LAI','NDMIw'];
-// var index = index_List[0];
-var aoi =  beilunhe//beilunhe, zhangjiangkou, dongzhaigang
-var points_export = mulan_beilun    //mulan_beilun,   Hailanci_zhangjiang,   Qiuqie_zhangjiang,    honghailan_dongzhai, jiaoguomu_dongzhai, hailian_dongzhai]);
-var point_col_name =['mulan_beilun']// mulan_beilun, 'Hailanci_zhangjiang' ,'Qiuqie_zhangjiang' , 'honghailan_dongzhai' , 'jiaoguomu_dongzhai','hailian_dongzhai'];
-// var point_col_list = ee.List([points_export])
 
-
-var windowSize_time = 60; 
+var windowSize_time = 60;
 var windowSize_space = 3;
 
-for(var num=0;num<4;num++){
+var exportFolder = 'HLS_MODIS_time_series';
+var exportScale = 30;
+
+for (var num = 0; num < index_List.length; num++) {
+
   var index = index_List[num];
-  var Band_List = ['time',index];
-  var start_date = '2015-01-01';
-  var end_date = '2017-01-01' ; // the Future
 
-  var HLS_ts = TS_daily_only(re_HLSTS(ee.Date(start_date).advance(-60,'day'), end_date, aoi));
-  var HLS_ts_index_super = Compute_index(HLS_ts, index).map(mask03NDVI).select(index).map(time_band).select(['time',index]);
-  var HLS_ts_index = HLS_ts_index_super.filterDate(start_date, end_date).select(index);
-  var MODIS_ts = MODIS_col.filterDate(start_date, end_date).filterBounds(aoi).map(ReCloud.MODISA1_remove_cloud).map(ReCloud.Scale_image_MODIS_SR)
-                        .select(['sur_refl_b03','sur_refl_b04','sur_refl_b01','sur_refl_b02','sur_refl_b06','sur_refl_b07'],['B1', 'B2', 'B3', 'B4', 'B5', 'B7']);
-  var MODIS_ts_index = Compute_index(MODIS_ts, index).map(MODIS_resample).map(mask03NDVI).select(index).map(time_band).select(['time',index]);
-  var MODIS_date_list = only_date_list(MODIS_ts_index).slice(1,-1,1);
-  print('MODIS_date_list_'+index, MODIS_date_list);
-  print('HLS_ts_index_super',HLS_ts_index_super);
-  print('MODIS_ts_index',MODIS_ts_index);
-  Map.addLayer(HLS_ts_index.select(index),{min: 0,max: 1,palette: ["9400d3","4b0082","0000ff","00ff00","ffff00","ff7f00","ff0000"]},'原始LS/S2');
-  Map.addLayer(MODIS_ts_index.select(index),{min: 0,max: 1,palette: ["9400d3","4b0082","0000ff","00ff00","ffff00","ff7f00","ff0000"]},'原始MODIS');
+  print('========================');
+  print('Processing:', index);
 
-  // var targetDate = ee.Date('2015-01-09');
-  var fuse_modis_col = MODIS_date_list.map(function fusion_image(targetDate){
-    var each_image = STARFM(ee.Date(targetDate), HLS_ts_index_super, MODIS_ts_index, windowSize_time, windowSize_space, Band_List);
-    return each_image;
+  var TS1 = buildFusionPeriod('2015-01-01', '2017-01-01', index);
+
+  var TS2 = buildFusionPeriod('2017-01-01', '2019-01-01', index);
+
+  var TS3 = buildHLSPeriod('2019-01-01', '2026-01-01', index);
+
+  var all_TS = TS1.merge(TS2).merge(TS3).sort('system:time_start');
+
+  print(index + '_image_count', all_TS.size());
+
+  var number_name = all_TS.aggregate_array('system:time_start').map(function(t) {
+    return ee.Date(t).format('YYYY-MM-dd');
   });
-  fuse_modis_col = ee.ImageCollection(fuse_modis_col);
-  print('fuse_modis_col', fuse_modis_col);
-  Map.addLayer(fuse_modis_col,{min: 0,max: 1,palette: ["9400d3","4b0082","0000ff","00ff00","ffff00","ff7f00","ff0000"]},"融合后的MODIS");
-  
-  var HLS_MODIS_ts_index =  TS_daily_only(HLS_ts_index.merge(fuse_modis_col).sort('system:time_start'));
-  Map.addLayer(HLS_MODIS_ts_index,{min: 0,max: 1,palette: ["9400d3","4b0082","0000ff","00ff00","ffff00","ff7f00","ff0000"]},"HLS_MODIS_ts_index");
-  
-  ......
-  ......
-  
+
+  var dataset = all_TS.select(index).toBands().rename(number_name);
+
+  print(index + '_dataset', dataset);
+
+  var points_list = points_export.toList(points_export.size());
+  var sequence = ee.List.sequence(0, points_list.size().subtract(1));
+
+  var points_time_series = ee.FeatureCollection(
+    ee.List(sequence.iterate(time_export, ee.List([])))
+  );
+
+  print(index + '_samples', points_time_series.limit(5));
+
+  Export.table.toDrive({
+    collection: points_time_series,
+    description: point_col_name + '_HLS_MODIS_' + index,
+    folder: exportFolder,
+    fileNamePrefix: point_col_name + '_' + index + '_2015_2025',
+    fileFormat: 'CSV'
+  });
+}
+
+function time_export(i, first) {
+
+  i = ee.Number(i);
+
+  var feature = ee.Feature(points_list.get(i));
+  var geo = feature.geometry();
+
+  var values = dataset.reduceRegion({
+    reducer: ee.Reducer.first(),
+    geometry: geo,
+    scale: exportScale,
+    bestEffort: true
+  });
+
+  var coord = geo.coordinates();
+
+  var output = ee.Feature(null, values)
+    .copyProperties(feature)
+    .set('point_id', i)
+    .set('longitude', coord.get(0))
+    .set('latitude', coord.get(1));
+
+  return ee.List(first).add(output);
+}
+
+function buildFusionPeriod(startDate, endDate, indexName) {
+
+  var bandList = ['time', indexName];
+
+  var HLS = TS_daily_only(
+    re_HLSTS(ee.Date(startDate).advance(-windowSize_time, 'day'), endDate, aoi)
+  );
+
+  var HLSIndexSuper = Compute_index(HLS, indexName)
+    .map(maskHighQualityVegetation)
+    .select(indexName)
+    .map(time_band)
+    .select(bandList);
+
+  var HLSIndex = HLSIndexSuper.filterDate(startDate, endDate).select(indexName);
+
+  var MODIS = MODIS_col.filterDate(startDate, endDate)
+    .filterBounds(aoi)
+    .map(ReCloud.MODISA1_remove_cloud)
+    .map(ReCloud.Scale_image_MODIS_SR)
+    .select(
+      ['sur_refl_b03','sur_refl_b04','sur_refl_b01','sur_refl_b02','sur_refl_b06','sur_refl_b07'],
+      ['B1','B2','B3','B4','B5','B7']
+    );
+
+  var MODISIndex = Compute_index(MODIS, indexName)
+    .map(MODIS_resample)
+    .map(maskHighQualityVegetation)
+    .select(indexName)
+    .map(time_band)
+    .select(bandList);
+
+  var modisDates = only_date_list(MODISIndex).slice(1, -1);
+
+  var fused = ee.ImageCollection.fromImages(
+    modisDates.map(function(targetDate) {
+      return STARFM(
+        ee.Date(targetDate),
+        HLSIndexSuper,
+        MODISIndex,
+        windowSize_time,
+        windowSize_space,
+        bandList,
+        indexName
+      );
+    })
+  );
+
+  return TS_daily_only(
+    HLSIndex.merge(fused).sort('system:time_start')
+  );
+}
